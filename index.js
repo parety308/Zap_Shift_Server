@@ -118,6 +118,19 @@ async function run() {
             // console.log(sessionId);
             const session = await stripe.checkout.sessions.retrieve(sessionId);
             // console.log(session);
+
+            const transactionId = session.payment_intent;
+            const queryExistingPayment = { transactionId: transactionId };
+            const existingPayment = await paymentCollections.findOne(queryExistingPayment);
+            if (existingPayment) {
+                return res.send({
+                    success: true,
+                    message: 'Payment already processed',
+                    trackingId: existingPayment.trackingId,
+                    transactionId: transactionId
+                });
+            }
+
             const trackingId = generateTrackingId();
             if (session.payment_status === 'paid') {
                 const parcelId = session.metadata.parcelId;
@@ -133,7 +146,7 @@ async function run() {
 
                 const payment = {
                     amount: session.amount_total / 100,
-                    transactionId: session.payment_intent,
+                    transactionId: transactionId,
                     currency: session.currency,
                     paymentStatus: session.payment_status,
                     senderEmail: session.customer_email,
@@ -141,20 +154,34 @@ async function run() {
                     parcelName: session.metadata.parcelName,
                     paidAt: new Date(),
                     paymentStatus: session.payment_status,
+                    trackingId: trackingId
                 }
 
                 if (session.payment_status === 'paid') {
                     const paymentResult = await paymentCollections.insertOne(payment);
-                    res.send({ success: true, 
+                    res.send({
+                        success: true,
                         modifyParcel: result,
                         trackingId: trackingId,
                         transactionId: session.payment_intent,
-                         paymentInfo: paymentResult });
+                        paymentInfo: paymentResult
+                    });
                 }
 
             }
             res.send({ success: false });
-        })
+        });
+
+        app.get('/payments', async (req, res) => {
+            const email = req.query.email;
+            const query = {};
+            if (email) {
+                query.senderEmail = email;
+            }
+            const options = { sort: { paidAt: -1 } }
+            const payments = await paymentCollections.find(query, options).toArray();
+            res.send(payments);
+        });
         await client.db("admin").command({ ping: 1 });
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
     }
