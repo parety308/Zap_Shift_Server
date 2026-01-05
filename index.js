@@ -67,18 +67,49 @@ async function run() {
         const paymentCollections = db.collection('payments');
         const riderCollections = db.collection('riders');
 
-        // Parcel related API
-        app.get('/parcels', async (req, res) => {
-            const query = {};
-            const { email } = req.query;
-            if (email) {
-                query.senderEmail = email;
+        //middle ware to verify admin
+        const verifyAdmin = async (req, res, next) => {
+            const requesterEmail = req.decoded_email;
+            const query = { email: requesterEmail };
+            const requesterAccount = await userCollections.findOne(query);
+            if (requesterAccount?.role === 'admin') {
+                next();
             }
-            const options = { sort: { createdAt: -1 } }
-            const parcels = await parcelCollections.find(query, options).toArray();
-            res.send(parcels);
+            else {
 
-        })
+                return res.status(403).send({ message: 'Forbidden access' });
+            }
+        }
+
+        // Parcel related APIs
+        app.get('/parcels', verifyFBToken, async (req, res) => {
+            const requesterEmail = req.decoded_email;
+            const { deliveryStatus } = req.query;
+
+            // find requester
+            const requester = await userCollections.findOne({ email: requesterEmail });
+            const isAdmin = requester?.role === 'admin';
+
+            let query = {};
+
+            // filter by delivery status (admin & user both)
+            if (deliveryStatus) {
+                query.deliveryStatus = deliveryStatus;
+            }
+
+            // normal user → only own parcels
+            if (!isAdmin) {
+                query.senderEmail = requesterEmail;
+            }
+
+            const parcels = await parcelCollections
+                .find(query)
+                .sort({ createdAt: -1 })
+                .toArray();
+
+            res.send(parcels);
+        });
+
 
         app.get('/parcels/:id', async (req, res) => {
             const id = req.params.id;
@@ -93,6 +124,33 @@ async function run() {
             const result = await parcelCollections.insertOne(parcel);
             res.send(result);
         });
+
+        app.patch('/parcels/:id', async (req, res) => {
+            const id = req.params.id;
+            const { riderId, riderName, riderEmail } = req.body;
+            const query = { _id: new ObjectId(id) };
+            const update = {
+                $set: {
+                    deliveryStatus: 'driver-assigned',
+                    riderId: riderId,
+                    riderName: riderName,
+                    riderEmail: riderEmail
+                }
+            }
+            const result = await parcelCollections.updateOne(query, update);
+
+            //update rider infotmation
+            const riderQuery = { _id: new ObjectId(riderId) };
+            const riderUpdate = {
+                $set: {
+                    workStatus: 'on-delivery',
+
+                }
+            }
+           const riderResult = await riderCollections.updateOne(riderQuery, riderUpdate);
+            res.send({ result, riderResult });
+        });
+
         app.delete('/parcels/:id', async (req, res) => {
             const parcelId = req.params.id;
             const cursor = { _id: new ObjectId(parcelId) };
@@ -170,6 +228,7 @@ async function run() {
                     $set: {
                         paymentStatus: 'paid',
                         trackingId: trackingId,
+                        deliveryStatus: 'pending-pickup'
                     }
                 }
                 const result = await parcelCollections.updateOne(query, update);
@@ -185,7 +244,8 @@ async function run() {
                     parcelName: session.metadata.parcelName,
                     paidAt: new Date(),
                     paymentStatus: session.payment_status,
-                    trackingId: trackingId
+                    trackingId: trackingId,
+                    deliveryStatus: session.deliveryStatus
                 }
 
                 if (session.payment_status === 'paid') {
@@ -220,6 +280,21 @@ async function run() {
         });
 
         // User related API
+        app.get('/users', verifyFBToken, async (req, res) => {
+            const { role } = req.query;
+            const query = role ? { role } : {};
+            const options = { sort: { createdAt: -1 } }
+            const users = await userCollections.find(query, options).limit(10).toArray();
+            res.send(users);
+        });
+
+        app.get('/users/:email/role', async (req, res) => {
+            const email = req.params.email;
+            const query = { email: email };
+            const user = await userCollections.findOne(query);
+            res.send({ role: user?.role || 'user' });
+        });
+
         app.post('/users', async (req, res) => {
             const user = req.body;
             user.role = 'user';
@@ -233,12 +308,42 @@ async function run() {
             res.send(result);
         });
 
+        //update user role
+        app.patch('/users/:id', verifyFBToken, verifyAdmin, async (req, res) => {
+            const userId = req.params.id;
+            const role = req.body.role;
+            const query = { _id: new ObjectId(userId) };
+            const update = {
+                $set: { role: role }
+            };
+            const result = await userCollections.updateOne(query, update);
+            res.send(result);
+        });
+
+        //delete user
+        app.delete('/users/:id', verifyFBToken, async (req, res) => {
+            const userId = req.params.id;
+            const query = { _id: new ObjectId(userId) };
+            const result = await userCollections.deleteOne(query);
+            res.send(result);
+        });
+
         // Rider related API
 
         app.get('/riders', async (req, res) => {
-            const { status } = req.query;
-            const query = status ? { status } : {};
-            const riders = await riderCollections.find(query).toArray();
+            const { status, workStatus, district } = req.query;
+            const query = {};
+            if (status) {
+                query.status = status;
+            }
+            if (workStatus) {
+                query.workStatus = workStatus;
+            }
+            if (district) {
+                query.district = district;
+            }
+            const options = { sort: { createdAt: -1 } }
+            const riders = await riderCollections.find(query, options).toArray();
             res.send(riders);
         });
         app.post('/riders', async (req, res) => {
@@ -249,18 +354,21 @@ async function run() {
             res.send(result);
         });
 
-        app.patch('/riders/:id', async (req, res) => {
+        app.patch('/riders/:id', verifyFBToken, verifyAdmin, async (req, res) => {
             const riderId = req.params.id;
             const status = req.body.status;
             const query = { _id: new ObjectId(riderId) };
             const update = {
-                $set: { status: status }
+                $set: {
+                    status: status,
+                    workStatus: status === 'approved' ? 'available' : 'unavailable'
+                }
             };
             const result = await riderCollections.updateOne(query, update);
-            if(status === 'approved'){
+            if (status === 'approved') {
                 const email = req.body.email;
                 const queryUser = { email: email };
-                const updateUser ={
+                const updateUser = {
                     $set: { role: 'rider' }
                 }
                 await userCollections.updateOne(queryUser, updateUser);
