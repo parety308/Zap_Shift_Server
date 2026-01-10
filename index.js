@@ -5,11 +5,13 @@ const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const stripe = require('stripe')(process.env.STRIPE_SECRET);
 const crypto = require("crypto");
 const admin = require("firebase-admin");
-const serviceAccount = require("./zapShift-firebase-admin-secret-key.json");
+
+
 const app = express()
 const port = process.env.PORT;
 
-
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const serviceAccount = JSON.parse(decoded);
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
 });
@@ -50,7 +52,7 @@ const client = new MongoClient(uri, {
 
 
 
-function generateTrackingId(prefix = "PAR") {
+function generateTrackingId(prefix = "PAR-YES") {
     const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     const random = crypto.randomBytes(3).toString("hex").toUpperCase();
 
@@ -60,7 +62,7 @@ function generateTrackingId(prefix = "PAR") {
 
 async function run() {
     try {
-        await client.connect();
+        // await client.connect();
         const db = client.db('zap_shift_data');
         const userCollections = db.collection('users');
         const parcelCollections = db.collection('parcels');
@@ -78,6 +80,18 @@ async function run() {
             }
             else {
 
+                return res.status(403).send({ message: 'Forbidden access' });
+            }
+        };
+        //middle ware to verify rider
+        const verifyRider = async (req, res, next) => {
+            const requesterEmail = req.decoded_email;
+            const query = { email: requesterEmail };
+            const requesterAccount = await riderCollectionsCollections.findOne(query);
+            if (requesterAccount?.role === 'rider') {
+                next();
+            }
+            else {
                 return res.status(403).send({ message: 'Forbidden access' });
             }
         };
@@ -149,6 +163,27 @@ async function run() {
             const id = req.params.id;
             const cursor = { _id: new ObjectId(id) };
             const result = await parcelCollections.findOne(cursor);
+            res.send(result);
+        });
+
+        app.get('/parcels/delivery-status/stats', async (req, res) => {
+            const pipeline = [
+                {
+                    $group: {
+                        _id: '$deliveryStatus',
+                        count: {
+                            $sum: 1
+                        }
+                    }
+                },
+                {
+                    $project: {
+                        status: '$_id',
+                        count: 1
+                    }
+                }
+            ];
+            const result = await parcelCollections.aggregate(pipeline).toArray();
             res.send(result);
         })
 
@@ -320,7 +355,7 @@ async function run() {
                 if (session.payment_status === 'paid') {
                     const paymentResult = await paymentCollections.insertOne(payment);
                     logTracking(trackingId, 'pending-pickup')
-                    res.send({
+                    return res.send({
                         success: true,
                         modifyParcel: result,
                         trackingId: trackingId,
@@ -330,7 +365,7 @@ async function run() {
                 }
 
             }
-            res.send({ success: false });
+            return res.send({ success: false });
         });
 
         app.get('/payments', verifyFBToken, async (req, res) => {
@@ -416,6 +451,64 @@ async function run() {
             const riders = await riderCollections.find(query, options).toArray();
             res.send(riders);
         });
+
+        app.get('/riders/delivery-per-day', async (req, res) => {
+            const email = req.query.email;
+            // console.log(email);
+            //aggregate on parcel
+            const pipeline = [
+                {
+                    $match: {
+                        riderEmail: email,
+                        deliveryStatus: 'delivered'
+                    }
+                },
+                {
+                    $lookup: {
+                        from: 'trackings',
+                        localField: 'trackingId',
+                        foreignField: 'trackingId',
+                        as: 'parcel_trackings'
+                    }
+                },
+                {
+                    $unwind: '$parcel_trackings'
+                },
+                {
+                    $match: {
+                        'parcel_trackings.status': 'delivered'
+                    }
+                },
+                {
+                    $addFields: {
+                        deliveryDate: {
+                            $dateToString: {
+                                format: '%Y-%m-%d',
+                                date: '$parcel_trackings.createdAt'
+                            }
+                        }
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$deliveryDate',
+                        totalDelivered: { $sum: 1 }
+                    }
+                },
+                {
+                    $project: {
+                        _id: 0,
+                        date: '$_id',
+                        totalDelivered: 1
+                    }
+                }
+            ]
+
+            const result = await parcelCollections.aggregate(pipeline).toArray();
+            //  console.log(result);
+            res.send(result);
+        });
+
         app.post('/riders', async (req, res) => {
             const rider = req.body;
             rider.status = 'pending';
@@ -454,8 +547,9 @@ async function run() {
             res.send(result);
 
         });
-        await client.db("admin").command({ ping: 1 });
-        console.log("Pinged your deployment. You successfully connected to MongoDB!");
+
+        // await client.db("admin").command({ ping: 1 });
+        // console.log("Pinged your deployment. You successfully connected to MongoDB!");
     }
     finally {
     }
